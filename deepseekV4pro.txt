@@ -1,0 +1,724 @@
+"""
+DeepSeek-V4pro Urinary System Disease Diagnosis and Assessment Program
+Function: Evaluate the diagnostic and therapeutic capability of DeepSeek large language model on urinary system diseases through three-stage progressive input of clinical case information.
+"""
+
+import os
+import sys
+import json
+import re
+import logging
+import asyncio
+import threading
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Set
+from copy import deepcopy
+
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
+from openai import AsyncOpenAI, APIError, APITimeoutError, RateLimitError, APIConnectionError, AuthenticationError, BadRequestError, InternalServerError
+from tenacity import (
+    retry, stop_after_delay, wait_exponential,
+    retry_if_exception_type, before_sleep_log, RetryError
+)
+
+
+# ============================================================================
+# Module 1: Configuration Constants
+# ============================================================================
+
+CONFIG = {
+    # Data paths
+    "input_excel": r"D:\DeepSeek临床研究\deepseekV4\泌尿系疾病数据集.xlsx",
+    "output_main": r"D:\DeepSeek临床研究\deepseekV4\泌尿系疾病_诊断筛选_deepseek.xlsx",
+    "output_repeat": r"D:\DeepSeek临床研究\deepseekV4\重复验证试验数据.xlsx",
+    "log_dir": r"D:\DeepSeek临床研究\deepseekV4\logs",
+
+    # API key configuration
+    "api_key": "sk-41acfa210bc64391b604ff43f686fee5",
+
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-pro",
+    "temperature": 0.2,
+    "max_tokens": 4096,
+    "timeout": 120,
+    "max_concurrent": 5,
+    "max_retry_wait": 300,
+    "repeat_sample_ratio": 0.20,
+    "random_state": 42,
+    "save_interval": 1,
+}
+
+RESULT_COLUMNS = {
+    1: ["Diagnosis_1", "Diagnosis_1_ICD10", "Diagnostic_and_Therapeutic_Plan_1", "Treatment_Modality_1", "Deepseek_Reasoning_1"],
+    2: ["Diagnosis_2", "Diagnosis_2_ICD10", "Diagnostic_and_Therapeutic_Plan_2", "Treatment_Modality_2", "Deepseek_Reasoning_2"],
+    3: ["Diagnosis_3", "Diagnosis_3_ICD10", "Diagnostic_and_Therapeutic_Plan_3", "Treatment_Modality_3", "Deepseek_Reasoning_3"],
+}
+
+
+# ============================================================================
+# Module 2: Logging System
+# ============================================================================
+
+def setup_logger(log_dir: str) -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("DeepSeekClinical")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, f"deepseek_api_{date_str}.log"),
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+# ============================================================================
+# Module 3: Data Loading and Preprocessing
+# ============================================================================
+
+def load_and_preprocess_data(filepath: str, logger: logging.Logger) -> pd.DataFrame:
+    logger.info(f"Loading data: {filepath}")
+    df = pd.read_excel(filepath, dtype=str, keep_default_na=False)
+    logger.info(f"Data loaded: {len(df)} rows, {len(df.columns)} columns")
+    logger.info(f"Column list: {df.columns.tolist()}")
+
+    required_cols = [
+        'Patient_ID', 'Gender', 'DOB', 'Disease_Group',
+        'Admission_Record', 'Auxiliary_Examination', 'Treatment_Course'
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    disease_counts = df['Disease_Group'].value_counts()
+    logger.info(f"Disease group distribution:\n{disease_counts.to_string()}")
+
+    if 'Case_Type' in df.columns:
+        logger.info(f"Unique Case_Type values: {df['Case_Type'].unique()}")
+
+    return df
+
+
+def stratified_sample(df: pd.DataFrame, ratio: float, logger: logging.Logger) -> pd.DataFrame:
+    sample_df = df.groupby('Disease_Group', group_keys=False).apply(
+        lambda x: x.sample(frac=ratio, random_state=CONFIG["random_state"])
+    )
+    logger.info(f"Stratified sampling completed: {len(sample_df)} cases (ratio={ratio})")
+    logger.info(f"Sampling distribution:\n{sample_df['Disease_Group'].value_counts().to_string()}")
+    return sample_df
+
+
+# ============================================================================
+# Module 4: Prompt Construction
+# ============================================================================
+
+def build_system_prompt() -> str:
+    return """You are an experienced urologist participating in a medical research study on the diagnosis and treatment of urological diseases. Based on the provided patient records, you will make diagnostic and treatment decisions.
+
+【Output Requirements】
+Please output strictly in JSON format without any additional text or markdown tags. The JSON format is as follows:
+{
+    "diagnosis": "Diagnosis name (in Chinese, give only the single most likely diagnosis)",
+    "icd10": "ICD-10 code (WHO International Classification of Diseases, 10th Revision)",
+    "treatment_plan": "Diagnostic and treatment plan (detailed description, including diagnostic basis, differential diagnosis, treatment regimen, etc.)",
+    "treatment_modality": "1 or 0 (1 for surgical treatment, 0 for conservative treatment)",
+    "reasoning": "Your clinical reasoning process (detailed explanation of diagnostic thinking)"
+}
+
+【Guiding Principles】
+1. Only answer with one most likely diagnosis and its corresponding ICD-10 code.
+2. Treatment measures fall into two main categories: conservative treatment (drugs, TCM physiotherapy, rehabilitation, etc.) or surgical treatment (specify the specific surgical procedure).
+3. The answer must be based solely on the provided patient case information; do not fabricate.
+4. Strictly output in JSON format."""
+
+
+def build_user_prompt(stage: int, row_data: dict) -> str:
+    stage_desc = {
+        1: "[Stage 1] Preliminary diagnosis based only on basic information and admission record",
+        2: "[Stage 2] Further diagnosis incorporating auxiliary examination results",
+        3: "[Stage 3] Final retrospective diagnosis incorporating treatment course (Note: This is a retrospective objective diagnosis based on complete information at admission)"
+    }
+
+    parts = [stage_desc[stage]]
+
+    gender = row_data.get('Gender', 'Unknown')
+    dob = row_data.get('DOB', 'Unknown')
+    parts.append(f"\n[Basic Information]")
+    parts.append(f"Gender: {gender}")
+    parts.append(f"Date of Birth: {dob}")
+
+    admission = row_data.get('Admission_Record', '')
+    if admission and admission != 'nan':
+        parts.append(f"\n[Admission Record]\n{admission}")
+
+    if stage >= 2:
+        aux_exam = row_data.get('Auxiliary_Examination', '')
+        if aux_exam and aux_exam != 'nan':
+            parts.append(f"\n[Auxiliary Examinations]\n{aux_exam}")
+
+    if stage >= 3:
+        treatment_course = row_data.get('Treatment_Course', '')
+        if treatment_course and treatment_course != 'nan':
+            parts.append(f"\n[Treatment Course]\n{treatment_course}")
+        parts.append("\n[Important Note] Please make a retrospective objective diagnosis based on the complete information above.")
+
+    return "\n".join(parts)
+
+
+# ============================================================================
+# Module 5: JSON Parsing (with error tolerance)
+# ============================================================================
+
+def parse_json_response(content: str, logger: logging.Logger) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r'\{.*\}', content, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    logger.error(f"JSON parsing failed, first 500 characters of raw content: {content[:500]}")
+    return {
+        "diagnosis": "PARSE_ERROR",
+        "icd10": "PARSE_ERROR",
+        "treatment_plan": f"JSON parsing failed, raw content: {content[:200]}",
+        "treatment_modality": None,
+        "reasoning": ""
+    }
+
+
+# ============================================================================
+# Module 6: Core API Call
+# ============================================================================
+
+def create_retry_decorator(logger: logging.Logger):
+    return retry(
+        stop=stop_after_delay(CONFIG["max_retry_wait"]),
+        wait=wait_exponential(multiplier=1, max=60),
+        retry=retry_if_exception_type((
+            APITimeoutError,
+            RateLimitError,
+            APIConnectionError,
+            InternalServerError,
+        )),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+
+
+async def call_deepseek_api(
+    async_client: AsyncOpenAI,
+    system_prompt: str,
+    user_prompt: str,
+    stage: int,
+    patient_id: str,
+    logger: logging.Logger
+) -> dict:
+    start_time = datetime.now()
+
+    try:
+        response = await async_client.chat.completions.create(
+            model=CONFIG["model"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=CONFIG["temperature"],
+            max_tokens=CONFIG["max_tokens"],
+            response_format={"type": "json_object"},
+            timeout=CONFIG["timeout"],
+        )
+
+        content = response.choices[0].message.content or ""
+
+        reasoning = ""
+        if hasattr(response.choices[0].message, 'reasoning_content'):
+            reasoning = response.choices[0].message.reasoning_content or ""
+
+        result = parse_json_response(content, logger)
+
+        if not reasoning and "reasoning" in result:
+            reasoning = result.get("reasoning", "")
+
+        result["reasoning"] = reasoning
+
+        usage = response.usage
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.debug(f"[{patient_id}] Stage {stage} completed | "
+                    f"Time={elapsed:.1f}s | "
+                    f"prompt_tokens={usage.prompt_tokens} | "
+                    f"completion_tokens={usage.completion_tokens} | "
+                    f"total_tokens={usage.total_tokens}")
+
+        return result
+
+    except AuthenticationError as e:
+        logger.error(f"[{patient_id}] Stage {stage} authentication failed: {str(e)}")
+        raise
+
+    except BadRequestError as e:
+        logger.error(f"[{patient_id}] Stage {stage} bad request: {str(e)}")
+        return {
+            "diagnosis": "BAD_REQUEST_ERROR",
+            "icd10": "BAD_REQUEST_ERROR",
+            "treatment_plan": str(e),
+            "treatment_modality": None,
+            "reasoning": ""
+        }
+
+
+async def call_with_retry(
+    async_client: AsyncOpenAI,
+    system_prompt: str,
+    user_prompt: str,
+    stage: int,
+    patient_id: str,
+    logger: logging.Logger
+) -> dict:
+    retry_decorator = create_retry_decorator(logger)
+
+    @retry_decorator
+    async def _call():
+        return await call_deepseek_api(
+            async_client, system_prompt, user_prompt, stage, patient_id, logger
+        )
+
+    try:
+        return await _call()
+    except RetryError as e:
+        logger.error(f"[{patient_id}] Stage {stage} retry exhausted: {str(e)}")
+        return {
+            "diagnosis": "RETRY_EXHAUSTED",
+            "icd10": "RETRY_EXHAUSTED",
+            "treatment_plan": f"Retry exhausted: {str(e)}",
+            "treatment_modality": None,
+            "reasoning": ""
+        }
+    except Exception as e:
+        logger.error(f"[{patient_id}] Stage {stage} unknown error: {str(e)}")
+        return {
+            "diagnosis": "API_ERROR",
+            "icd10": "API_ERROR",
+            "treatment_plan": str(e),
+            "treatment_modality": None,
+            "reasoning": ""
+        }
+
+
+# ============================================================================
+# Module 7: Three‑Stage Processing for a Single Case
+# ============================================================================
+
+async def process_single_case(
+    async_client: AsyncOpenAI,
+    case_data: dict,
+    patient_id: str,
+    logger: logging.Logger
+) -> dict:
+    system_prompt = build_system_prompt()
+    results = {"Patient_ID": patient_id}
+
+    for stage in range(1, 4):
+        logger.debug(f"[{patient_id}] Starting stage {stage}...")
+
+        user_prompt = build_user_prompt(stage, case_data)
+
+        api_result = await call_with_retry(
+            async_client, system_prompt, user_prompt, stage, patient_id, logger
+        )
+
+        tm = api_result.get("treatment_modality")
+        if isinstance(tm, str):
+            tm_code = 1 if "1" in tm or "surgery" in tm.lower() else 0
+        elif isinstance(tm, (int, float)):
+            tm_code = int(tm)
+        else:
+            tm_code = None
+
+        stage_cols = RESULT_COLUMNS[stage]
+        results[stage_cols[0]] = api_result.get("diagnosis", "")
+        results[stage_cols[1]] = api_result.get("icd10", "")
+        results[stage_cols[2]] = api_result.get("treatment_plan", "")
+        results[stage_cols[3]] = tm_code
+        results[stage_cols[4]] = api_result.get("reasoning", "")
+
+        diagnosis_value = results[stage_cols[0]]
+        display_text = diagnosis_value[:30] if diagnosis_value else 'N/A'
+        logger.info(f"[{patient_id}] Stage {stage} completed: diagnosis={display_text}...")
+
+    return results
+
+
+# ============================================================================
+# Module 8: Real‑time Saving
+# ============================================================================
+
+_save_lock = threading.Lock()
+
+def save_single_result(output_path: str, result: dict, logger: logging.Logger):
+    with _save_lock:
+        try:
+            if os.path.exists(output_path):
+                df = pd.read_excel(output_path, dtype=str)
+            else:
+                return False
+
+            patient_id = str(result.get("Patient_ID", ""))
+            if not patient_id:
+                return False
+
+            mask = df['Patient_ID'].astype(str) == patient_id
+            if mask.any():
+                for key, value in result.items():
+                    if key != "Patient_ID" and key in df.columns:
+                        df.loc[mask, key] = str(value) if value is not None else ""
+
+                with pd.ExcelWriter(output_path, engine='openpyxl', mode='w') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Diagnostic_Results')
+
+                    worksheet = writer.sheets['Diagnostic_Results']
+                    for col_idx, col_name in enumerate(df.columns, 1):
+                        max_len = df[col_name].astype(str).map(len).max()
+                        adjusted_width = min(max(max_len + 2, 10), 60)
+                        worksheet.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+
+                        if max_len > 30:
+                            for row_idx in range(2, len(df) + 2):
+                                cell = worksheet.cell(row=row_idx, column=col_idx)
+                                cell.alignment = Alignment(wrap_text=True, vertical='top')
+
+                logger.info(f"[{patient_id}] Result saved to Excel in real time")
+                return True
+
+        except Exception as e:
+            logger.error(f"Real‑time save failed: {str(e)}")
+            return False
+
+    return False
+
+
+# ============================================================================
+# Module 9: Concurrent Scheduling (with real‑time saving)
+# ============================================================================
+
+async def run_concurrent_processing(
+    df: pd.DataFrame,
+    completed_ids: Set[str],
+    output_path: str,
+    logger: logging.Logger,
+    is_repeat: bool = False
+) -> List[dict]:
+    pending_df = df[~df['Patient_ID'].isin(completed_ids)].copy()
+
+    if len(pending_df) == 0:
+        logger.info("All cases are already processed, nothing to do")
+        return []
+
+    logger.info(f"Pending cases: {len(pending_df)}")
+
+    api_key = CONFIG["api_key"]
+    if not api_key:
+        raise ValueError("API key is not set. Please fill in api_key in CONFIG.")
+
+    async_client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=CONFIG["base_url"],
+        timeout=CONFIG["timeout"]
+    )
+
+    semaphore = asyncio.Semaphore(CONFIG["max_concurrent"])
+    results_list = []
+    total_count = len(pending_df)
+    completed_count = 0
+
+    async def bounded_process(row_data: dict, patient_id: str):
+        async with semaphore:
+            result = await process_single_case(async_client, row_data, patient_id, logger)
+
+            if output_path:
+                save_single_result(output_path, result, logger)
+
+            return result
+
+    tasks = []
+    for idx, row in pending_df.iterrows():
+        patient_id = str(row['Patient_ID'])
+        case_data = row.to_dict()
+        tasks.append(bounded_process(case_data, patient_id))
+
+    for coro in asyncio.as_completed(tasks):
+        result = await coro
+        results_list.append(result)
+        completed_count += 1
+
+        if completed_count % 1 == 0 or completed_count == total_count:
+            progress = completed_count / total_count * 100
+            prefix = "[Repeat Validation]" if is_repeat else "[Main Process]"
+            print(f"\r{prefix} Progress: {progress:.1f}% ({completed_count}/{total_count})", end="", flush=True)
+
+    print()
+
+    await async_client.close()
+    return results_list
+
+
+# ============================================================================
+# Module 10: Checkpoint / Resume
+# ============================================================================
+
+def find_checkpoint(output_path: str, logger: logging.Logger) -> Set[str]:
+    if not os.path.exists(output_path):
+        return set()
+
+    try:
+        existing = pd.read_excel(output_path, dtype=str)
+
+        completed_mask = (
+            existing["Diagnosis_1"].notna() &
+            (existing["Diagnosis_1"] != "") &
+            (existing["Diagnosis_1"] != "API_ERROR") &
+            (existing["Diagnosis_1"] != "PARSE_ERROR") &
+            (existing["Diagnosis_1"] != "RETRY_EXHAUSTED") &
+            (existing["Diagnosis_1"] != "BAD_REQUEST_ERROR")
+        )
+
+        completed_ids = set(existing.loc[completed_mask, "Patient_ID"].astype(str))
+        logger.info(f"Checkpoint resume: {len(completed_ids)} cases already completed")
+        return completed_ids
+
+    except Exception as e:
+        logger.warning(f"Failed to read checkpoint file: {str(e)}")
+        return set()
+
+
+# ============================================================================
+# Module 11: Result Output
+# ============================================================================
+
+def save_results(df: pd.DataFrame, output_path: str, logger: logging.Logger):
+    logger.info(f"Saving results: {output_path}")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Diagnostic_Results')
+
+        worksheet = writer.sheets['Diagnostic_Results']
+        for col_idx, col_name in enumerate(df.columns, 1):
+            max_len = df[col_name].astype(str).map(len).max()
+            adjusted_width = min(max(max_len + 2, 10), 60)
+            worksheet.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+
+            if max_len > 30:
+                for row_idx in range(2, len(df) + 2):
+                    cell = worksheet.cell(row=row_idx, column=col_idx)
+                    cell.alignment = Alignment(wrap_text=True, vertical='top')
+
+    logger.info(f"Results saved: {output_path}")
+
+
+def merge_results_to_df(original_df: pd.DataFrame, results_list: List[dict]) -> pd.DataFrame:
+    if not results_list:
+        return original_df
+
+    for result in results_list:
+        patient_id = str(result["Patient_ID"])
+        mask = original_df['Patient_ID'].astype(str) == patient_id
+
+        if mask.any():
+            for key, value in result.items():
+                if key != "Patient_ID" and key in original_df.columns:
+                    original_df.loc[mask, key] = value
+
+    return original_df
+
+
+# ============================================================================
+# Module 12: Repeat Validation Data Preparation
+# ============================================================================
+
+def build_repeat_validation_excel(
+    original_df: pd.DataFrame,
+    sample_patient_ids: List[str],
+    first_results: pd.DataFrame,
+    second_results: List[dict],
+    logger: logging.Logger
+) -> pd.DataFrame:
+    repeat_rows = []
+    second_results_dict = {str(r["Patient_ID"]): r for r in second_results}
+
+    for patient_id in sample_patient_ids:
+        patient_id_str = str(patient_id)
+
+        first_row = first_results[first_results['Patient_ID'].astype(str) == patient_id_str]
+        if not first_row.empty:
+            row_first = first_row.iloc[0].to_dict()
+            row_first["Run"] = 1
+            repeat_rows.append(row_first)
+
+        if patient_id_str in second_results_dict:
+            second_result = second_results_dict[patient_id_str]
+            row_second = original_df[original_df['Patient_ID'].astype(str) == patient_id_str].iloc[0].to_dict()
+            row_second["Run"] = 2
+
+            for key, value in second_result.items():
+                if key != "Patient_ID":
+                    row_second[key] = value
+
+            repeat_rows.append(row_second)
+
+    result_df = pd.DataFrame(repeat_rows)
+    logger.info(f"Repeat validation data constructed: {len(result_df)} rows ({len(sample_patient_ids)} patients x 2 runs)")
+    return result_df
+
+
+# ============================================================================
+# Module 13: Summary Statistics
+# ============================================================================
+
+def print_summary(df: pd.DataFrame, logger: logging.Logger):
+    total = len(df)
+
+    success_counts = {}
+    for stage in range(1, 4):
+        col = f"Diagnosis_{stage}"
+        success = df[col].notna() & (df[col] != "") & (~df[col].str.contains("ERROR|EXHAUSTED", na=False))
+        success_counts[stage] = success.sum()
+
+    logger.info("=" * 60)
+    logger.info("Summary Statistics")
+    logger.info("=" * 60)
+    logger.info(f"Total cases: {total}")
+    logger.info(f"Stage 1 success: {success_counts[1]} ({success_counts[1]/total*100:.1f}%)")
+    logger.info(f"Stage 2 success: {success_counts[2]} ({success_counts[2]/total*100:.1f}%)")
+    logger.info(f"Stage 3 success: {success_counts[3]} ({success_counts[3]/total*100:.1f}%)")
+
+    logger.info("\nBy disease group:")
+    for group in df['Disease_Group'].unique():
+        group_df = df[df['Disease_Group'] == group]
+        logger.info(f"  {group}: {len(group_df)} cases")
+
+
+# ============================================================================
+# Main Program
+# ============================================================================
+
+async def main():
+    logger = setup_logger(CONFIG["log_dir"])
+    logger.info("=" * 60)
+    logger.info("DeepSeek-V4pro Urinary System Disease Diagnosis Assessment Program started")
+    logger.info(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 60)
+
+    logger.info("Configuration:")
+    logger.info(f"  Input file: {CONFIG['input_excel']}")
+    logger.info(f"  Output file (main): {CONFIG['output_main']}")
+    logger.info(f"  Output file (repeat): {CONFIG['output_repeat']}")
+    logger.info(f"  Model: {CONFIG['model']}")
+    logger.info(f"  Temperature: {CONFIG['temperature']}")
+    logger.info(f"  Concurrency: {CONFIG['max_concurrent']}")
+    logger.info(f"  Max retry wait: {CONFIG['max_retry_wait']}s")
+
+    try:
+        df = load_and_preprocess_data(CONFIG["input_excel"], logger)
+
+        sample_df = stratified_sample(df, CONFIG["repeat_sample_ratio"], logger)
+        sample_patient_ids = sample_df['Patient_ID'].astype(str).tolist()
+        logger.info(f"Repeat validation sampled Patient_IDs: {sample_patient_ids[:10]}... (total {len(sample_patient_ids)} cases)")
+
+        completed_ids = find_checkpoint(CONFIG["output_main"], logger)
+
+        if not completed_ids:
+            output_df = df.copy()
+            for stage in range(1, 4):
+                for col in RESULT_COLUMNS[stage]:
+                    if col not in output_df.columns:
+                        output_df[col] = ""
+            save_results(output_df, CONFIG["output_main"], logger)
+        else:
+            output_df = pd.read_excel(CONFIG["output_main"], dtype=str)
+
+        if len(completed_ids) < len(df):
+            logger.info("Starting main process API calls...")
+            results_list = await run_concurrent_processing(
+                df, completed_ids, CONFIG["output_main"], logger, is_repeat=False
+            )
+            output_df = merge_results_to_df(output_df, results_list)
+            save_results(output_df, CONFIG["output_main"], logger)
+        else:
+            logger.info("Main process already completed, skipping")
+            output_df = pd.read_excel(CONFIG["output_main"], dtype=str)
+
+        logger.info("Starting repeat validation test...")
+
+        repeat_completed_ids = set()
+        if os.path.exists(CONFIG["output_repeat"]):
+            try:
+                repeat_df = pd.read_excel(CONFIG["output_repeat"], dtype=str)
+                run2_df = repeat_df[repeat_df.get("Run", 1) == 2]
+                repeat_completed_ids = set(run2_df["Patient_ID"].astype(str))
+                logger.info(f"Repeat validation checkpoint: {len(repeat_completed_ids)} cases already completed")
+            except:
+                pass
+
+        pending_repeat_ids = [pid for pid in sample_patient_ids if pid not in repeat_completed_ids]
+
+        if pending_repeat_ids:
+            pending_repeat_df = df[df['Patient_ID'].astype(str).isin(pending_repeat_ids)]
+            second_results = await run_concurrent_processing(
+                pending_repeat_df, set(), CONFIG["output_repeat"], logger, is_repeat=True
+            )
+            repeat_output_df = build_repeat_validation_excel(
+                df, sample_patient_ids, output_df, second_results, logger
+            )
+            save_results(repeat_output_df, CONFIG["output_repeat"], logger)
+        else:
+            logger.info("Repeat validation already completed, skipping")
+
+        print_summary(output_df, logger)
+
+        logger.info("=" * 60)
+        logger.info("Program finished successfully")
+        logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 60)
+
+    except AuthenticationError as e:
+        logger.error(f"API authentication failed. Please check api_key in CONFIG.")
+        raise
+    except Exception as e:
+        logger.error(f"Program execution error: {str(e)}", exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    asyncio.run(main())
